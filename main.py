@@ -1,4 +1,5 @@
 import os
+import gc
 import pickle
 from typing import Optional, List, Dict, Any, Tuple
 
@@ -20,8 +21,7 @@ TMDB_BASE = "https://api.themoviedb.org/3"
 TMDB_IMG_500 = "https://image.tmdb.org/t/p/w500"
 
 if not TMDB_API_KEY:
-    # Don't crash import-time in production if you prefer; but for you better fail early:
-    raise RuntimeError("TMDB_API_KEY missing. Put it in .env as TMDB_API_KEY=xxxx")
+    print("WARNING: TMDB_API_KEY is missing. Set it in environment variables.")
 
 app = FastAPI(title="Movie Recommender API", version="1.0")
 
@@ -40,10 +40,9 @@ INDICES_PATH = os.path.join(BASE_DIR, "indices.pkl")
 TFIDF_MATRIX_PATH = os.path.join(BASE_DIR, "tfidf_matrix.pkl")
 TFIDF_PATH = os.path.join(BASE_DIR, "tfidf.pkl")
 
-df: Optional[pd.DataFrame] = None
+titles_list: List[str] = []
 indices_obj: Any = None
 tfidf_matrix: Any = None
-tfidf_obj: Any = None
 
 TITLE_TO_IDX: Optional[Dict[str, int]] = None
 
@@ -88,6 +87,11 @@ async def tmdb_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
     - Network errors -> 502
     - TMDB API errors -> 502 with detail
     """
+    if not TMDB_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="TMDB_API_KEY environment variable is not configured on Render. Please set it in your Render dashboard environment variables.",
+        )
     q = dict(params)
     q["api_key"] = TMDB_API_KEY
 
@@ -203,8 +207,8 @@ def tfidf_recommend_titles(
     Returns list of (title, score) from local df using cosine similarity on TF-IDF matrix.
     Safe against missing columns/rows.
     """
-    global df, tfidf_matrix
-    if df is None or tfidf_matrix is None:
+    global titles_list, tfidf_matrix
+    if not titles_list or tfidf_matrix is None:
         raise HTTPException(status_code=500, detail="TF-IDF resources not loaded")
 
     idx = get_local_idx_by_title(query_title)
@@ -221,7 +225,7 @@ def tfidf_recommend_titles(
         if int(i) == int(idx):
             continue
         try:
-            title_i = str(df.iloc[int(i)]["title"])
+            title_i = titles_list[int(i)]
         except Exception:
             continue
         out.append((title_i, float(scores[int(i)])))
@@ -250,34 +254,34 @@ async def attach_tmdb_card_by_title(title: str) -> Optional[TMDBMovieCard]:
         return None
 
 # =========================
-# STARTUP: LOAD PICKLES
+# STARTUP: LOAD PICKLES (MEMORY OPTIMIZED)
 # =========================
 @app.on_event("startup")
 def load_pickles():
-    global df, indices_obj, tfidf_matrix, tfidf_obj, TITLE_TO_IDX
+    global titles_list, indices_obj, tfidf_matrix, TITLE_TO_IDX
 
-    # Load df
+    # Load df and extract titles only to save RAM
     with open(DF_PATH, "rb") as f:
-        df = pickle.load(f)
+        raw_df = pickle.load(f)
+        if hasattr(raw_df, "title"):
+            titles_list = [str(t) for t in raw_df["title"]]
+        else:
+            titles_list = [str(x) for x in raw_df.iloc[:, 0]]
+        del raw_df
 
     # Load indices
     with open(INDICES_PATH, "rb") as f:
         indices_obj = pickle.load(f)
 
-    # Load TF-IDF matrix (usually scipy sparse)
+    # Load TF-IDF matrix (scipy sparse)
     with open(TFIDF_MATRIX_PATH, "rb") as f:
         tfidf_matrix = pickle.load(f)
-
-    # Load tfidf vectorizer (optional, not used directly here)
-    with open(TFIDF_PATH, "rb") as f:
-        tfidf_obj = pickle.load(f)
 
     # Build normalized map
     TITLE_TO_IDX = build_title_to_idx_map(indices_obj)
 
-    # sanity
-    if df is None or "title" not in df.columns:
-        raise RuntimeError("df.pkl must contain a DataFrame with a 'title' column")
+    # Force garbage collection to free memory
+    gc.collect()
 
 
 # =========================
