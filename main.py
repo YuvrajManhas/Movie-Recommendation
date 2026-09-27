@@ -195,6 +195,14 @@ def get_local_idx_by_title(title: str) -> int:
     key = _norm_title(title)
     if key in TITLE_TO_IDX:
         return int(TITLE_TO_IDX[key])
+
+    # Clean non-alphanumeric characters for flexible matching
+    clean_key = "".join(c for c in key if c.isalnum())
+    if clean_key:
+        for k, idx in TITLE_TO_IDX.items():
+            if "".join(c for c in k if c.isalnum()) == clean_key:
+                return int(idx)
+
     raise HTTPException(
         status_code=404, detail=f"Title not found in local dataset: '{title}'"
     )
@@ -384,7 +392,8 @@ async def recommend_tfidf(
 # ---------- BUNDLE: Details + TF-IDF recs + Genre recs ----------
 @app.get("/movie/search", response_model=SearchBundleResponse)
 async def search_bundle(
-    query: str = Query(..., min_length=1),
+    query: Optional[str] = Query(None),
+    tmdb_id: Optional[int] = Query(None),
     tfidf_top_n: int = Query(12, ge=1, le=30),
     genre_limit: int = Query(12, ge=1, le=30),
 ):
@@ -393,21 +402,24 @@ async def search_bundle(
       - movie details
       - TF-IDF recommendations (local) + posters
       - Genre recommendations (TMDB) + posters
-
-    NOTE:
-    - It selects the BEST match from TMDB for the given query.
-    - If you want MULTIPLE matches, use /tmdb/search
     """
-    best = await tmdb_search_first(query)
-    if not best:
-        raise HTTPException(
-            status_code=404, detail=f"No TMDB movie found for query: {query}"
-        )
+    if not query and not tmdb_id:
+        raise HTTPException(status_code=400, detail="Either query or tmdb_id must be provided")
 
-    tmdb_id = int(best["id"])
-    details = await tmdb_movie_details(tmdb_id)
+    if tmdb_id:
+        details = await tmdb_movie_details(tmdb_id)
+        search_query = query or details.title
+    else:
+        best = await tmdb_search_first(query)
+        if not best:
+            raise HTTPException(
+                status_code=404, detail=f"No TMDB movie found for query: {query}"
+            )
+        tmdb_id = int(best["id"])
+        details = await tmdb_movie_details(tmdb_id)
+        search_query = query
 
-    # 1) TF-IDF recommendations (never crash endpoint)
+    # 1) TF-IDF recommendations (local dataset)
     tfidf_items: List[TFIDFRecItem] = []
 
     recs: List[Tuple[str, float]] = []
@@ -415,15 +427,33 @@ async def search_bundle(
         # try local dataset by TMDB title
         recs = tfidf_recommend_titles(details.title, top_n=tfidf_top_n)
     except Exception:
-        # fallback to user query
+        # fallback to search query
         try:
-            recs = tfidf_recommend_titles(query, top_n=tfidf_top_n)
+            recs = tfidf_recommend_titles(search_query, top_n=tfidf_top_n)
         except Exception:
             recs = []
 
     for title, score in recs:
         card = await attach_tmdb_card_by_title(title)
-        tfidf_items.append(TFIDFRecItem(title=title, score=score, tmdb=card))
+        if card:
+            tfidf_items.append(TFIDFRecItem(title=title, score=score, tmdb=card))
+
+    # Fallback: If local dataset does not contain the movie (e.g. recent movies on home screen),
+    # fetch recommendations/similar movies from TMDB API so recommendations NEVER fail!
+    if not tfidf_items:
+        try:
+            tmdb_recs = await tmdb_get(f"/movie/{tmdb_id}/recommendations", {"language": "en-US", "page": 1})
+            results = tmdb_recs.get("results", [])
+            if not results:
+                tmdb_recs = await tmdb_get(f"/movie/{tmdb_id}/similar", {"language": "en-US", "page": 1})
+                results = tmdb_recs.get("results", [])
+            
+            cards = await tmdb_cards_from_results(results, limit=tfidf_top_n)
+            for c in cards:
+                if c.tmdb_id != details.tmdb_id:
+                    tfidf_items.append(TFIDFRecItem(title=c.title, score=1.0, tmdb=c))
+        except Exception:
+            pass
 
     # 2) Genre recommendations (TMDB discover by first genre)
     genre_recs: List[TMDBMovieCard] = []
@@ -444,7 +474,7 @@ async def search_bundle(
         genre_recs = [c for c in cards if c.tmdb_id != details.tmdb_id]
 
     return SearchBundleResponse(
-        query=query,
+        query=search_query,
         movie_details=details,
         tfidf_recommendations=tfidf_items,
         genre_recommendations=genre_recs,

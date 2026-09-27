@@ -345,7 +345,7 @@ elif st.session_state.view == "details":
     if title:
         bundle, err2 = api_get_json(
             "/movie/search",
-            params={"query": title, "tfidf_top_n": 12, "genre_limit": 12},
+            params={"tmdb_id": tmdb_id, "query": title, "tfidf_top_n": 12, "genre_limit": 12},
         )
 
         if not err2 and bundle:
